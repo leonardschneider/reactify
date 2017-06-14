@@ -2,18 +2,29 @@ package reactify
 
 import java.util.concurrent.atomic.AtomicReference
 
-abstract class AbstractState[T] private(distinct: Boolean, cache: Boolean) extends State[T] {
+abstract class AbstractState[T] private(distinct: Boolean,
+                                        cache: Boolean,
+                                        retainRecursion: Boolean) extends State[T] {
   private var lastValue: T = _
-  private val function = new AtomicReference[() => T]
-  private val previous = new AtomicReference[Option[PreviousFunction[T]]](None)
+//  private val function = new AtomicReference[() => T]
+//  private val previous = new AtomicReference[Option[PreviousFunction[T]]](None)
+  val instance = new AtomicReference[List[StateInstance[T]]](Nil)
   private val monitoring = new AtomicReference[Set[Observable[_]]](Set.empty)
 
-  private val replacement = new ThreadLocal[Option[PreviousFunction[T]]] {
-    override def initialValue(): Option[PreviousFunction[T]] = None
+//  private val replacement = new ThreadLocal[Option[PreviousFunction[T]]] {
+//    override def initialValue(): Option[PreviousFunction[T]] = None
+//  }
+
+  private val stack = new ThreadLocal[List[StateInstance[T]]] {
+    override def initialValue(): List[StateInstance[T]] = instance.get()
   }
 
   private val monitor: Listener[Any] = (_: Any) => {
-    replace(function.get(), newFunction = false)
+    if (instance.get().nonEmpty) {
+      replace(instance.get().head.function, newFunction = false)
+    } else {
+      println("*** Ignoring empty!")
+    }
   }
 
   private def updateValue(value: T): Unit = {
@@ -25,8 +36,9 @@ abstract class AbstractState[T] private(distinct: Boolean, cache: Boolean) exten
 
   def this(function: () => T,
            distinct: Boolean = true,
-           cache: Boolean = true) = {
-    this(distinct, cache)
+           cache: Boolean = true,
+           retainRecursion: Boolean = false) = {
+    this(distinct, cache, retainRecursion)
     replace(function, newFunction = true)
   }
 
@@ -34,7 +46,23 @@ abstract class AbstractState[T] private(distinct: Boolean, cache: Boolean) exten
 
   override def get: T = get(cache)
 
-  def get(cache: Boolean): T = replacement.get() match {
+  def get(cache: Boolean): T = {
+    AbstractState.reference(this)
+    if (cache) {
+      lastValue
+    } else {
+      val originalStack = stack.get()
+      val instance = originalStack.headOption.getOrElse(throw new RuntimeException("Reached top of stack!"))
+      stack.set(originalStack.tail)
+      try {
+        instance.state.getOrElse(instance.function())
+      } finally {
+        stack.set(originalStack)
+      }
+    }
+  }
+
+  /*def get(cache: Boolean): T = replacement.get() match {
     case Some(p) => {
       replacement.set(p.previous)
       p.function()
@@ -52,30 +80,40 @@ abstract class AbstractState[T] private(distinct: Boolean, cache: Boolean) exten
         replacement.set(None)
       }
     }
-  }
+  }*/
 
   protected def set(value: => T): Unit = synchronized {
     replace(() => value, newFunction = true)
   }
 
-  protected def replace(function: () => T, newFunction: Boolean): Unit = {
+  protected def replace(function: () => T, newFunction: Boolean): Unit = synchronized {
+    val instance = new StateInstance[T](None, function)
     if (newFunction) {
-      val p = Option(this.function.get()).map { f =>
-        new PreviousFunction[T](f, previous.get())
-      }.getOrElse(new PreviousFunction[T](() => lastValue, previous.get()))
-      previous.set(Some(p))
+      if (retainRecursion || this.instance.get().isEmpty) {
+        this.instance.set(instance :: this.instance.get())
+      } else {
+        val previous = new StateInstance(Some(lastValue), this.instance.get().head.function)
+        this.instance.set(List(instance, previous))
+      }
     }
+    this.stack.remove()
+
+//    if (newFunction) {
+//      val p = Option(this.function.get()).map { f =>
+//        new PreviousFunction[T](f, previous.get())
+//      }.getOrElse(new PreviousFunction[T](() => lastValue, previous.get()))
+//      previous.set(Some(p))
+//    }
     val previousObservables = AbstractState.observables.get()
     AbstractState.observables.set(Set.empty)
     try {
-      this.function.set(function)
       val value: T = get(cache = false)
 
       val oldObservables = observing
       var newObservables = AbstractState.observables.get()
       if (newFunction && !newObservables.contains(this)) {
         // No recursive reference, we can clear previous
-        previous.set(None)
+        this.stack.set(List(instance))
       }
       newObservables -= this
 
